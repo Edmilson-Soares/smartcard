@@ -1,0 +1,76 @@
+// Exemplo: lista os leitores, espera um cartão, reconhece o modelo e lê
+// o que dá para ler sem chaves especiais.
+//   fogu run build:native && fogu run atrlist && fogu run main.fg
+import scard from "./scard.fg"
+import fs from "fogu:fs"
+
+fn showMifare(card) {
+    print(`  UID: ${card.uid()?}`)
+    // Setor 0 com a chave de fábrica (A = FFFFFFFFFFFF).
+    const [blocks, err] = card.readSector(0)
+    if err != nil {
+        print(`  setor 0: ${err.message}`)
+        return true, nil
+    }
+    for i, b in blocks { print(`  bloco ${i}: ${b.hex()}`) }
+    return true, nil
+}
+
+fn showUltralight(card) {
+    print(`  UID: ${card.uid()?}`)
+    const pages = card.readPages(0, 16)?
+    print(`  páginas 0..15: ${pages.hex()}`)
+    return true, nil
+}
+
+fn showChip(card, id) {
+    for app in id.get("applications") ?? [] {
+        print(`  aplicação ${app.name} (${app.aid})`)
+        for sub in app.get("applications") ?? [] {
+            print(`    ${sub.aid} ${sub.get("label") ?? ""}`)
+        }
+    }
+    return true, nil
+}
+
+fn main() {
+    print(`fogusmartcard ${scard.version()?}`)
+    if fs.exists("data/smartcard_list.txt") {
+        print(`base de ATRs: ${scard.loadAtrList("data/smartcard_list.txt")?} modelos`)
+    }
+    const ctx = scard.open()?
+    const readers = ctx.readers()?
+    if len(readers) == 0 {
+        print("nenhum leitor PC/SC encontrado; conecte um e rode de novo")
+        return true, nil
+    }
+    for r in readers {
+        let card = "vazio"
+        if r.card { card = `${r.card_name} [${r.atr}]` }
+        print(`leitor: ${r.name}: ${card}`)
+    }
+
+    print("aproxime ou insira um cartão (30s)...")
+    const ev = ctx.waitForCard("", 30s)?
+    if ev == nil {
+        print("nenhum cartão")
+        return true, nil
+    }
+    const card = ctx.connect(ev.reader)?
+    const id = card.identify()?
+    print(`cartão: ${id.name}`)
+    print(`  tipo ${id.kind}, família ${id.family}, ${id.interface}, confiança ${id.confidence} (${id.source})`)
+    print(`  ATR ${card.atr}, protocolo ${card.protocol}`)
+    for m in id.matches { print(`  base: ${m}`) }
+
+    if card.family == "mifare_classic" { showMifare(card)? }
+    else if card.family == "mifare_ultralight" { showUltralight(card)? }
+    else if card.family == "iso7816" { showChip(card, id)? }
+
+    card.close()?
+    ctx.close()?
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil { print(`erro: ${err.message}`) }

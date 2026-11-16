@@ -1,0 +1,149 @@
+// Testes do registro.fg sem leitor: formato, layout dos blocos e um
+// MIFARE Classic / Ultralight simulados em memória.
+//   fogu test examples
+import { test, expect } from "fogu:test"
+import registro from "./registro.fg"
+
+const PESSOA = {
+    nome: "José António Silva",
+    nascimento: "1990-05-12",
+    documento: "12345678",
+    telefone: "+351 912 345 678",
+    email: "jose@exemplo.pt",
+}
+
+// Cartão de memória simulado: blocos (Classic) ou páginas (Ultralight) num map.
+struct Fake {
+    family = ""
+    kind = ""
+    mem = {}
+    size = 16
+    writes = 0
+
+    new(family, kind, size) {
+        this.family = family
+        this.kind = kind
+        this.size = size
+        this.mem = {}
+    }
+
+    _get(addr) {
+        if this.mem.has(str(addr)) { return this.mem[str(addr)] }
+        const zeros = []
+        for i in 0..this.size { zeros.push(0) }
+        return zeros
+    }
+
+    readBlock(block, _key = "", _keyB = false) { return bytes(this._get(block)), nil }
+
+    writeBlock(block, data, _key = "", _keyB = false, _unsafe = false) {
+        if block % 4 == 3 { return nil, error(`trailer ${block}`) }
+        this.mem[str(block)] = data.toList()
+        this.writes += 1
+        return true, nil
+    }
+
+    readPages(page, count = 4) {
+        let out = []
+        for p in page..(page + count) { out = out.concat(this._get(p)) }
+        return bytes(out), nil
+    }
+
+    writePages(page, data, _unsafe = false) {
+        if page < 4 { return nil, error(`página ${page} protegida`) }
+        this.mem[str(page)] = data.toList()
+        this.writes += 1
+        return true, nil
+    }
+}
+
+test("encode/decode: ida e volta com acentos", (): error => {
+    const buf = registro.encode(PESSOA)?
+    expect(buf.toList().slice(0, 2)).toEqual([70, 80])
+    expect(registro.temRegistro(buf)).toBe(true)
+    expect(registro.tamanho(buf)).toBe(len(buf) - 4)
+    const back = registro.decode(buf)?
+    for c in registro.CAMPOS { expect(back[c]).toBe(PESSOA[c]) }
+    return nil
+})
+
+test("decode: campos em falta ficam vazios, quebras de linha são trocadas", (): error => {
+    const buf = registro.encode({ nome: "Ana\nSilva" })?
+    const back = registro.decode(buf)?
+    expect(back.nome).toBe("Ana Silva")
+    expect(back.email).toBe("")
+    return nil
+})
+
+test("decode: recusa cabeçalho errado e registro truncado", (): error => {
+    const [_a, e1] = registro.decode(bytes([0, 0, 0, 0, 65]))
+    expect(e1.message).toContain("cabeçalho")
+    const [_b, e2] = registro.decode(bytes([70, 80, 0, 9, 65, 66]))
+    expect(e2.message).toContain("truncado")
+    return nil
+})
+
+test("blocosClassic: só blocos de dados, do setor 1 em diante", (): error => {
+    const k1 = registro.blocosClassic("mifare_classic_1k")
+    expect(len(k1)).toBe(45)
+    expect(k1[0]).toBe(4)
+    expect(k1.contains(7)).toBe(false)
+    expect(k1.contains(63)).toBe(false)
+    expect(k1[len(k1) - 1]).toBe(62)
+    const k4 = registro.blocosClassic("mifare_classic_4k")
+    expect(len(k4)).toBe(31 * 3 + 8 * 15)
+    expect(k4.contains(128)).toBe(true)
+    expect(k4.contains(143)).toBe(false)
+    expect(len(registro.blocosClassic("mifare_mini"))).toBe(12)
+    return nil
+})
+
+test("Classic simulado: gravar, ler e apagar", (): error => {
+    const card = new Fake("mifare_classic", "mifare_classic_1k", 16)
+    const area = registro.abrir(card, { key: "A0A1A2A3A4A5" })?
+    expect(area.capacidade()).toBe(45 * 16 - 4)
+    expect(area.key).toBe("A0A1A2A3A4A5")
+    const [_r, semNada] = area.ler()
+    expect(semNada.message).toContain("não tem um registro")
+
+    const usados = area.gravar(PESSOA)?
+    expect(usados).toBe(5)                       // 4 + 75 bytes -> 5 blocos
+    expect(card.mem.has("4")).toBe(true)
+    expect(card.mem.has("8")).toBe(true)         // pulou o trailer 7
+    const lido = area.ler()?
+    for c in registro.CAMPOS { expect(lido[c]).toBe(PESSOA[c]) }
+
+    expect(area.apagar()?).toBe(5)
+    const [_x, apagado] = area.ler()
+    expect(apagado.message).toContain("não tem um registro")
+    return nil
+})
+
+test("Ultralight simulado: capacidade pelo capability container", (): error => {
+    const ntag = new Fake("mifare_ultralight", "mifare_ultralight", 4)
+    ntag.mem["3"] = [0xE1, 0x10, 0x12, 0x00]      // NTAG213: 0x12 * 8 = 144 bytes
+    const area = registro.abrir(ntag)?
+    expect(len(area.slots)).toBe(36)
+    expect(area.slots[0]).toBe(4)
+    expect(area.capacidade()).toBe(140)
+    const usados = area.gravar(PESSOA)?
+    expect(usados).toBe(20)                      // 79 bytes -> 20 páginas
+    const lido = area.ler()?
+    expect(lido.nome).toBe(PESSOA.nome)
+    expect(lido.telefone).toBe(PESSOA.telefone)
+
+    // Sem CC: 48 bytes (12 páginas); --bytes força outro tamanho.
+    const ul = new Fake("mifare_ultralight", "mifare_ultralight", 4)
+    expect(len((registro.abrir(ul)?).slots)).toBe(12)
+    expect(len((registro.abrir(ul, { bytes: 504 })?).slots)).toBe(126)
+    const [_g, cheio] = (registro.abrir(ul)?).gravar(PESSOA)
+    expect(cheio.message).toContain("não cabe")
+    return nil
+})
+
+test("cartão com chip não tem área de registro", (): error => {
+    const chip = new Fake("iso7816", "emv", 16)
+    const [_a, err] = registro.abrir(chip)
+    expect(err.message).toContain("não é de memória")
+    return nil
+})

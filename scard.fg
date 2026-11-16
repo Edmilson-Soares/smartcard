@@ -1,0 +1,467 @@
+// scard.fg — smart cards (PC/SC) para Fogu, sobre a lib Rust fogusmartcard
+// via fogu:ffi: leitores, eventos de inserção/remoção, APDUs, reconhecimento
+// do modelo do cartão e leitura/gravação de cartões de memória (MIFARE).
+// Funciona com qualquer leitor PC/SC (Windows, Linux com pcscd, macOS).
+// Veja README.md.
+import { Native, ms as _nms, waitLoop, setCooperative as _setCoop } from "./_native.fg"
+import json from "fogu:json"
+
+let _default = nil
+
+const _SIGNATURES = {
+    fsc_set_sink: [["ptr"], "i32"],
+    fsc_version: [["buffer", "i64"], "i64"],
+    fsc_last_error: [["buffer", "i64"], "i64"],
+    fsc_pending: [["buffer", "i64"], "i64"],
+    fsc_open: [[], "i64"],
+    fsc_close: [["i64"], "i32"],
+    fsc_readers: [["i64", "buffer", "i64"], "i64"],
+    fsc_wait: [["i64", "i64", "buffer", "i64"], "i64"],
+    fsc_connect: [["i64", "str", "str"], "i64"],
+    fsc_disconnect: [["i64", "i32"], "i32"],
+    fsc_reconnect: [["i64", "i32"], "i32"],
+    fsc_card_status: [["i64", "buffer", "i64"], "i64"],
+    fsc_attributes: [["i64", "buffer", "i64"], "i64"],
+    fsc_transmit: [["i64", "str", "i32", "buffer", "i64"], "i64"],
+    fsc_apdu: [["i64", "str", "i32", "buffer", "i64"], "i64"],
+    fsc_transmit_batch: [["i64", "str", "i32", "buffer", "i64"], "i64"],
+    fsc_control: [["i64", "i64", "str", "buffer", "i64"], "i64"],
+    fsc_parse_atr: [["str", "buffer", "i64"], "i64"],
+    fsc_identify_atr: [["str", "buffer", "i64"], "i64"],
+    fsc_identify: [["i64", "i32", "buffer", "i64"], "i64"],
+    fsc_db_load: [["str"], "i64"],
+    fsc_db_clear: [[], "i32"],
+    fsc_db_count: [[], "i64"],
+    fsc_uid: [["i64", "buffer", "i64"], "i64"],
+    fsc_mifare_auth: [["i64", "i64", "str", "i32"], "i32"],
+    fsc_read: [["i64", "i64", "i64", "buffer", "i64"], "i64"],
+    fsc_write: [["i64", "i64", "str", "i32"], "i32"],
+    fsc_mifare_read: [["i64", "i64", "str", "i32", "buffer", "i64"], "i64"],
+    fsc_mifare_read_sector: [["i64", "i64", "str", "i32", "buffer", "i64"], "i64"],
+    fsc_mifare_write: [["i64", "i64", "str", "str", "i32", "i32"], "i32"],
+}
+
+const _native = new Native("smartcard", "fogusmartcard", "fsc", _SIGNATURES, "FOGU_SMARTCARD_LIB", nil)
+const _fn = _native.api
+
+// No import: reconhece o sistema e a arquitetura e já carrega o binário
+// certo (native/<so>-<arch>/...). Se faltar, o erro volta na primeira chamada.
+_native.autoload()
+
+// O que foi detectado e carregado: { platform, os, file, path, loaded, error }.
+export fn nativeInfo() { return _native.info() }
+
+// setCooperative(false): esperas direto na lib (menor latência; congela as
+// outras tarefas fg enquanto espera). Padrão: true (esperas em fatias).
+export fn setCooperative(on) { return _setCoop(on) }
+
+// Carrega a biblioteca nativa (native/<plataforma>/fogusmartcard, native/fogusmartcard,
+// o build do cargo ou FOGU_SMARTCARD_LIB). `path` força um arquivo ou pasta.
+export fn load(path = nil) {
+    return _native.load(path)
+}
+
+// Caminho da lib carregada (nil antes de load()).
+export fn libraryPath() { return _native.path }
+
+fn _last_error() { return _native.lastError() }
+
+fn _status(rc) { return _native.status(rc) }
+
+// Saídas da lib: chegam inteiras pelo callback (sink) do _native.fg, sem
+// buffer fixo nem a segunda chamada de *_pending. cap é ignorado (compatibilidade).
+struct _Out {
+    new(cap = 0) {}
+    text(f) { return _native.text(f) }
+    json(f) { return _native.json(f) }
+}
+
+// Bytes como hex: aceita str (já em hex), buffer ou lista de inteiros.
+export fn hex(value) {
+    if value == nil { return "" }
+    const t = typeof(value)
+    if t == "str" { return value }
+    if t == "buffer" { return value.hex() }
+    return bytes(value).hex()
+}
+
+// hex -> buffer
+export fn fromHex(text) {
+    if text == "" { return bytes([]) }
+    return bytes(text, "hex")
+}
+
+// Resposta de APDU: { data, sw, sw1, sw2, ok, status } + bytes (buffer).
+fn _response(r) {
+    r.bytes = fromHex(r.data)
+    return r
+}
+
+export fn version() {
+    load()?
+    return _native.text((b, n) => _fn.fsc_version(b, n))
+}
+
+// Decodifica um ATR (hex ou buffer): convenção, protocolos, Fi/Di, T=1,
+// bytes históricos, TCK...
+export fn parseAtr(atr) {
+    load()?
+    return new _Out(8192).json((b, n) => _fn.fsc_parse_atr(hex(atr), b, n))
+}
+
+// Reconhece o modelo pelo ATR, sem leitor:
+// { name, kind, family, interface, confidence, source, matches, ... }
+export fn identifyAtr(atr) {
+    load()?
+    return new _Out(8192).json((b, n) => _fn.fsc_identify_atr(hex(atr), b, n))
+}
+
+// Carrega uma base de ATRs: o smartcard_list.txt do pcsc-tools (milhares de
+// modelos) ou um .json próprio [{ atr, name, kind }]. Devolve quantos entraram.
+export fn loadAtrList(path) {
+    load()?
+    const n = _fn.fsc_db_load(path)
+    if n < 0 { return nil, _last_error() }
+    return n, nil
+}
+
+export fn clearAtrList() {
+    load()?
+    _fn.fsc_db_clear()
+    return true, nil
+}
+
+export fn atrListSize() {
+    load()?
+    return _fn.fsc_db_count(), nil
+}
+
+export struct Context {
+    handle = 0
+    _out = nil
+
+    new(handle) {
+        this.handle = handle
+        this._out = new _Out(65536)
+    }
+
+    // [{ name, card, atr, state, card_name }]
+    readers() {
+        return this._out.json((b, n) => _fn.fsc_readers(this.handle, b, n))
+    }
+
+    // Espera até timeout (duração como 5s, ou ms; -1 = sem limite) por eventos:
+    // [{ event: "inserted" | "removed" | "reader_added" | "reader_removed",
+    //    reader, atr, name, kind }]; [] se o tempo acabou. Na primeira chamada
+    // os leitores e cartões já presentes aparecem como added/inserted.
+    wait(timeout = -1) {
+        // em fatias (setCooperative): as outras tarefas fg rodam enquanto espera
+        return waitLoop(_ms(timeout), (slice) => this._out.json((b, n) => _fn.fsc_wait(this.handle, slice, b, n)))
+    }
+
+    // Espera um cartão ser inserido (em reader, ou em qualquer leitor se
+    // vazio) e devolve o evento; nil se o tempo acabar.
+    waitForCard(reader = "", timeout = -1) {
+        for r in this.readers()? {
+            if r.card && (reader == "" || r.name == reader) {
+                return { event: "inserted", reader: r.name, atr: r.atr, name: r.get("card_name") }, nil
+            }
+        }
+        while true {
+            const events = this.wait(timeout)?
+            if len(events) == 0 { return nil, nil }
+            for ev in events {
+                if ev.event == "inserted" && (reader == "" || ev.reader == reader) { return ev, nil }
+            }
+        }
+        return nil, nil
+    }
+
+    // Conecta ao cartão de reader (vazio = primeiro leitor com cartão).
+    // options: share ("shared" | "exclusive" | "direct"), protocol ("any" | "t0" | "t1" | "raw").
+    connect(reader = "", options = {}) {
+        const h = _fn.fsc_connect(this.handle, reader, json.stringify(options))
+        if h < 0 { return nil, _last_error() }
+        const card = new Card(h, this)
+        card._refresh()?
+        return card, nil
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _fn.fsc_close(this.handle)
+        this.handle = 0
+        if _default == this { _default = nil }
+        return _status(rc)
+    }
+}
+
+export struct Card {
+    handle = 0
+    reader = ""
+    atr = ""
+    kind = ""
+    family = ""
+    protocol = nil
+    ctx = nil
+    _out = nil
+
+    new(handle, ctx) {
+        this.handle = handle
+        this.ctx = ctx
+        this._out = new _Out(140000)
+    }
+
+    _refresh() {
+        const s = this.status()?
+        this.reader = s.reader
+        this.atr = s.atr
+        this.kind = s.kind
+        this.family = s.family
+        this.protocol = s.protocol
+        return true, nil
+    }
+
+    // { reader, atr, protocol, kind, family }
+    status() {
+        return this._out.json((b, n) => _fn.fsc_card_status(this.handle, b, n))
+    }
+
+    // Fabricante, modelo e serial do leitor (os que o driver informar).
+    attributes() {
+        return this._out.json((b, n) => _fn.fsc_attributes(this.handle, b, n))
+    }
+
+    // Reconhece o cartão: pelo ATR e, com probe, lendo o UID e procurando
+    // aplicações (EMV, PIV, OpenPGP, FIDO, PKCS#15, NDEF, GlobalPlatform).
+    identify(probe = true) {
+        let flags = 0
+        if probe { flags = 1 }
+        return this._out.json((b, n) => _fn.fsc_identify(this.handle, flags, b, n))
+    }
+
+    // ---- APDUs ----
+
+    // Envia um APDU (hex, buffer ou lista de bytes). Segue 61xx/6Cxx sozinho,
+    // a menos que raw. Devolve { data, sw, sw1, sw2, ok, status, bytes }.
+    transmit(apdu, raw = false) {
+        let flags = 0
+        if raw { flags = 1 }
+        const r = this._out.json((b, n) => _fn.fsc_transmit(this.handle, hex(apdu), flags, b, n))?
+        return _response(r), nil
+    }
+
+    // Envia um comando montado: { cla, ins, p1, p2 | p1p2, data, le }. data
+    // pode ser hex, buffer ou lista; le de 1 a 65536 (estendido se preciso).
+    send(cmd, raw = false) {
+        let flags = 0
+        if raw { flags = 1 }
+        const r = this._out.json((b, n) => _fn.fsc_apdu(this.handle, json.stringify(_cmd(cmd)), flags, b, n))?
+        return _response(r), nil
+    }
+
+    // Vários APDUs numa única transação (nenhum outro programa intercala).
+    batch(cmds, stopOnError = false) {
+        const items = []
+        for c in cmds {
+            if typeof(c) == "map" { items.push(_cmd(c)) } else { items.push(hex(c)) }
+        }
+        let flags = 0
+        if stopOnError { flags = 2 }
+        const list = this._out.json((b, n) => _fn.fsc_transmit_batch(this.handle, json.stringify(items), flags, b, n))?
+        for r in list { _response(r) }
+        return list, nil
+    }
+
+    // Comando direto para o leitor (SCardControl), com o número de função
+    // do driver (ex. 3500 para o escape dos leitores ACS). Devolve um buffer.
+    control(code, data = "") {
+        const out = this._out.text((b, n) => _fn.fsc_control(this.handle, code, hex(data), b, n))?
+        return fromHex(out), nil
+    }
+
+    // ---- ISO 7816-4 ----
+
+    // SELECT por nome (AID).
+    selectAid(aid) {
+        return this.send({ ins: 164, p1: 4, p2: 0, data: aid, le: 256 })
+    }
+
+    // SELECT por identificador de arquivo (ex. "3F00", "2F00").
+    selectFile(fid) {
+        return this.send({ ins: 164, p1: 0, p2: 0, data: fid, le: 256 })
+    }
+
+    readBinary(offset = 0, length = 256) {
+        return this.send({ ins: 176, p1p2: offset, le: length })
+    }
+
+    updateBinary(offset, data) {
+        return this.send({ ins: 214, p1p2: offset, data: data })
+    }
+
+    // READ RECORD do registro record (do EF corrente, ou do sfi).
+    readRecord(record, sfi = 0) {
+        return this.send({ ins: 178, p1: record, p2: sfi * 8 + 4, le: 256 })
+    }
+
+    // VERIFY do PIN (texto ASCII, hex não). ref é a referência do PIN
+    // (128 = 0x80, o mais comum). Em erro 63Cx, status diz as tentativas.
+    verify(pin, ref = 128) {
+        return this.send({ ins: 32, p1: 0, p2: ref, data: bytes(pin).hex() })
+    }
+
+    // GET DATA de um objeto (tag até 2 bytes, ex. 159 = 0x9F, ou 0x9F17 = 40727).
+    getData(tag) {
+        return this.send({ ins: 202, p1p2: tag, le: 256 })
+    }
+
+    // ---- cartões de memória sem contato (PC/SC parte 3) ----
+
+    // UID (hex).
+    uid() {
+        return this._out.text((b, n) => _fn.fsc_uid(this.handle, b, n))
+    }
+
+    // Autentica o setor do bloco (MIFARE Classic). key em hex ou buffer
+    // ("" = FFFFFFFFFFFF, a chave de fábrica); keyB usa a chave B.
+    auth(block, key = "", keyB = false) {
+        return _status(_fn.fsc_mifare_auth(this.handle, block, hex(key), _keyType(keyB)))
+    }
+
+    // READ BINARY bruto: length bytes do bloco/página addr, como buffer.
+    // MIFARE Classic precisa de auth() antes; Ultralight lê 4 páginas.
+    read(addr, length = 16) {
+        const out = this._out.text((b, n) => _fn.fsc_read(this.handle, addr, length, b, n))?
+        return fromHex(out), nil
+    }
+
+    // UPDATE BINARY com as regras do tipo do cartão: Classic grava 16
+    // bytes e protege o bloco 0 e os trailers; Ultralight grava páginas de 4
+    // bytes e protege as páginas 0..3. unsafe libera essas áreas.
+    write(addr, data, unsafe = false) {
+        return _status(_fn.fsc_write(this.handle, addr, hex(data), _flag(unsafe)))
+    }
+
+    // Autentica e lê um bloco MIFARE Classic (16 bytes, buffer).
+    readBlock(block, key = "", keyB = false) {
+        const out = this._out.text((b, n) => _fn.fsc_mifare_read(this.handle, block, hex(key), _keyType(keyB), b, n))?
+        return fromHex(out), nil
+    }
+
+    // Autentica e grava um bloco MIFARE Classic (16 bytes). Bloco 0 e
+    // trailers exigem unsafe, e trailers com bits de acesso inválidos são
+    // sempre recusados (travariam o setor).
+    writeBlock(block, data, key = "", keyB = false, unsafe = false) {
+        return _status(_fn.fsc_mifare_write(this.handle, block, hex(data), hex(key), _keyType(keyB), _flag(unsafe)))
+    }
+
+    // Todos os blocos de um setor (lista de buffers).
+    readSector(sector, key = "", keyB = false) {
+        const list = this._out.json((b, n) => _fn.fsc_mifare_read_sector(this.handle, sector, hex(key), _keyType(keyB), b, n))?
+        const out = []
+        for h in list { out.push(fromHex(h)) }
+        return out, nil
+    }
+
+    // Lê todos os setores de um MIFARE Classic (Mini 5, 1K 16, 4K 40):
+    // [{ sector, blocks }] ou [{ sector, error }] quando a chave não abre.
+    dump(key = "", keyB = false) {
+        let sectors = 16
+        if this.kind == "mifare_classic_4k" { sectors = 40 }
+        if this.kind == "mifare_mini" { sectors = 5 }
+        const out = []
+        for s in 0..sectors {
+            const [blocks, err] = this.readSector(s, key, keyB)
+            if err != nil {
+                out.push({ sector: s, error: err.message })
+            } else {
+                out.push({ sector: s, blocks: blocks })
+            }
+        }
+        return out, nil
+    }
+
+    // Ultralight/NTAG: count páginas (4 bytes cada) a partir de page.
+    readPages(page, count = 4) {
+        let data = []
+        let p = page
+        while len(data) < count * 4 {
+            const chunk = this.read(p, 16)?
+            for b in chunk.toList() { data.push(b) }
+            p = p + 4
+        }
+        return bytes(data.slice(0, count * 4)), nil
+    }
+
+    // Ultralight/NTAG: grava data (múltiplo de 4 bytes) a partir de page.
+    writePages(page, data, unsafe = false) {
+        return this.write(page, data, unsafe)
+    }
+
+    // ---- conexão ----
+
+    // Reconecta; reset = true faz um reset a quente no cartão.
+    reconnect(reset = false) {
+        let init = 0
+        if reset { init = 1 }
+        _status(_fn.fsc_reconnect(this.handle, init))?
+        return this._refresh()
+    }
+
+    // Desconecta. disposition: "leave" (padrão), "reset", "unpower", "eject".
+    close(disposition = "leave") {
+        if this.handle == 0 { return true, nil }
+        const codes = { leave: 0, reset: 1, unpower: 2, eject: 3 }
+        const rc = _fn.fsc_disconnect(this.handle, codes.get(disposition) ?? 0)
+        this.handle = 0
+        return _status(rc)
+    }
+}
+
+fn _ms(timeout) { return _nms(timeout) }
+
+fn _keyType(keyB) {
+    if keyB { return 1 }
+    return 0
+}
+
+fn _flag(on) {
+    if on { return 1 }
+    return 0
+}
+
+// Comando para JSON: data em hex.
+fn _cmd(cmd) {
+    const out = {}
+    for k, v in cmd { out[k] = v }
+    if cmd.has("data") { out.data = hex(cmd.data) }
+    return out
+}
+
+// Abre um contexto PC/SC (para listar leitores, esperar eventos e conectar).
+export fn open() {
+    load()?
+    const h = _fn.fsc_open()
+    if h < 0 { return nil, _last_error() }
+    return new Context(h), nil
+}
+
+// Contexto compartilhado do módulo, aberto na primeira vez.
+fn _ctx() {
+    if _default == nil { _default = open()? }
+    return _default, nil
+}
+
+// Atalhos sobre o contexto compartilhado.
+export fn readers() {
+    return (_ctx()?).readers()
+}
+
+export fn connect(reader = "", options = {}) {
+    return (_ctx()?).connect(reader, options)
+}
+
+export fn waitForCard(reader = "", timeout = -1) {
+    return (_ctx()?).waitForCard(reader, timeout)
+}

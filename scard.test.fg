@@ -1,0 +1,131 @@
+// Testes do scard.fg. Precisam da lib nativa (fogu run build:native).
+// Os de ATR rodam sem leitor; os de cartão são pulados se não houver
+// leitor com cartão inserido.
+//   fogu test
+import { test, skip, expect } from "fogu:test"
+import scard from "./scard.fg"
+import fs from "fogu:fs"
+import time from "fogu:time"
+
+const CLASSIC_1K = "3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 01 00 00 00 00 6A"
+
+test("carrega a lib nativa", (): error => {
+    expect(scard.version()?).toBe("0.1.0")
+    return nil
+})
+
+test("decodifica um ATR", (): error => {
+    const a = scard.parseAtr("3BF81300008131FE15597562696B657934D4")?
+    expect(a.protocols).toEqual([1])
+    expect(a.tck_ok).toBe(true)
+    expect(a.historical_text).toBe("Yubikey4")
+    expect(a.t1.ifsc).toBe(254)
+    const [_r, err] = scard.parseAtr("3B 8F 80")
+    expect(err.message).toContain("truncated")
+    return nil
+})
+
+test("reconhece modelos pelo ATR", (): error => {
+    const c = scard.identifyAtr(CLASSIC_1K)?
+    expect(c.name).toBe("MIFARE Classic 1K")
+    expect(c.family).toBe("mifare_classic")
+    expect(c.interface).toBe("contactless")
+    expect((scard.identifyAtr("3B 8F 80 01 80 4F 0C A0 00 00 03 06 03 00 03 00 00 00 00 68")?).family).toBe("mifare_ultralight")
+    expect((scard.identifyAtr("3B 81 80 01 80 80")?).kind).toBe("desfire")
+    expect((scard.identifyAtr(bytes("3BF81300008131FE15597562696B657934D4", "hex"))?).kind).toBe("token")
+    return nil
+})
+
+test("base própria em JSON tem precedência", (): error => {
+    scard.clearAtrList()?
+    expect(scard.loadAtrList("cards.json")?).toBe(1)
+    const c = scard.identifyAtr(CLASSIC_1K)?
+    expect(c.source).toBe("user")
+    expect(c.name).toContain("base própria")
+    scard.clearAtrList()?
+    expect(scard.atrListSize()?).toBe(0)
+    return nil
+})
+
+let withList = skip
+if fs.exists("data/smartcard_list.txt") { withList = test }
+
+withList("base do pcsc-tools (fogu run atrlist)", (): error => {
+    const n = scard.loadAtrList("data/smartcard_list.txt")?
+    expect(n > 1000).toBe(true)
+    const c = scard.identifyAtr(CLASSIC_1K)?
+    expect(len(c.matches) > 0).toBe(true)
+    // Um cartão de contato genérico ganha nome pela base.
+    const y = scard.identifyAtr("3B F8 13 00 00 81 31 FE 15 59 75 62 69 6B 65 79 34 D4")?
+    expect(len(y.matches) > 0).toBe(true)
+    scard.clearAtrList()?
+    return nil
+})
+
+test("hex aceita str, buffer e lista", (): error => {
+    expect(scard.hex([0, 164, 4, 0])).toBe("00a40400")
+    expect(scard.hex("00A4")).toBe("00A4")
+    expect(scard.fromHex("0aff").toList()).toEqual([10, 255])
+    expect(scard.fromHex("").toList()).toEqual([])
+    return nil
+})
+
+test("lista leitores sem erro (mesmo sem nenhum)", (): error => {
+    const ctx = scard.open()?
+    const list = ctx.readers()?
+    expect(typeof(list)).toBe("list")
+    // Sem eventos novos, um wait curto termina (na 1a chamada pode trazer os presentes).
+    ctx.wait(100ms)?
+    ctx.close()?
+    return nil
+})
+
+// Testes com cartão: só se houver um leitor com cartão inserido.
+fn _hasCard() {
+    const [list, err] = scard.readers()
+    if err != nil { return false }
+    for r in list { if r.card { return true } }
+    return false
+}
+
+let withCard = skip
+if _hasCard() { withCard = test }
+
+withCard("conecta, identifica e envia um APDU", (): error => {
+    const card = scard.connect()?
+    expect(card.atr).toContain("3B")
+    const id = card.identify()?
+    print(`    ${card.reader}: ${id.name} (${id.kind}, ${id.source})`)
+    // SELECT de um AID que não existe: o cartão responde, não importa o SW.
+    const r = card.selectAid("A0000000000000")?
+    expect(len(r.sw)).toBe(4)
+    card.close()?
+    return nil
+})
+
+test("espera em fatias: outras tarefas fg rodam durante a espera", (): error => {
+    const ctx = scard.open()?
+    let ticks = 0
+    fg fn() {
+        for i in 0..5 {
+            ticks += 1
+            time.delay(10ms)
+        }
+    }()
+    const t0 = time.monotonic()
+    ctx.wait(0)?
+    const evs = ctx.wait(200ms)?
+    const during = ticks
+    expect(typeof(evs)).toBe("list")
+    expect(time.monotonic() - t0).toBeGreaterThan(0.15)
+    expect(during).toBe(5)
+    ctx.close()?
+    return nil
+})
+
+test("nativeInfo mostra a plataforma e o binário carregado", () => {
+    const i = scard.nativeInfo()
+    expect(i.loaded).toBe(true)
+    expect(i.platform).toContain(i.os)
+    expect(i.path).toContain(i.file)
+})

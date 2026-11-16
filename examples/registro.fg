@@ -1,0 +1,201 @@
+// registro.fg — um registro pessoal (nome, nascimento, documento, telefone,
+// e-mail) guardado num cartão de memória sem contato, com o scard.fg:
+//   MIFARE Classic   blocos de 16 bytes, do setor 1 em diante (sem os trailers)
+//   Ultralight/NTAG  páginas de 4 bytes, da página 4 em diante
+// Formato no cartão: "FP" + tamanho (2 bytes, big-endian) + campos em UTF-8
+// separados por "\n", na ordem de CAMPOS. O resto da área fica em zeros.
+// Cartões com chip (EMV, e-CPF, PIV...) não têm área livre padrão: lá os dados
+// pessoais ficam dentro da aplicação do cartão e exigem APDUs específicos.
+
+export const CAMPOS = ["nome", "nascimento", "documento", "telefone", "email"]
+export const ROTULOS = {
+    nome: "Nome",
+    nascimento: "Nascimento",
+    documento: "Documento",
+    telefone: "Telefone",
+    email: "E-mail",
+}
+
+const MAGIC = [70, 80]   // "FP"
+const HEADER = 4
+
+// registro (map com os CAMPOS) -> buffer pronto para gravar.
+export fn encode(registro) {
+    const partes = []
+    for c in CAMPOS {
+        partes.push(str(registro.get(c, "")).replace("\n", " ").trim())
+    }
+    const payload = bytes(partes.join("\n")).toList()
+    const n = len(payload)
+    if n > 65535 { return nil, error(`registro grande demais (${n} bytes)`) }
+    return bytes(MAGIC.concat([n >> 8, n & 0xFF]).concat(payload)), nil
+}
+
+// Os primeiros bytes lidos do cartão têm um registro?
+export fn temRegistro(buf) {
+    const b = buf.toList()
+    return len(b) >= HEADER && b[0] == MAGIC[0] && b[1] == MAGIC[1]
+}
+
+// Tamanho do registro anunciado no cabeçalho (sem o cabeçalho).
+export fn tamanho(buf) {
+    const b = buf.toList()
+    return b[2] << 8 | b[3]
+}
+
+// buffer lido do cartão -> registro (map com os CAMPOS; os que faltam ficam "").
+export fn decode(buf) {
+    if !temRegistro(buf) { return nil, error("o cartão não tem um registro (cabeçalho FP ausente)") }
+    const b = buf.toList()
+    const n = tamanho(buf)
+    if len(b) < HEADER + n {
+        return nil, error(`registro truncado: ${n} bytes anunciados, ${len(b) - HEADER} lidos`)
+    }
+    const partes = bytes(b.slice(HEADER, HEADER + n)).text().split("\n")
+    const out = {}
+    for i, c in CAMPOS {
+        if i < len(partes) { out[c] = partes[i] } else { out[c] = "" }
+    }
+    return out, nil
+}
+
+// Blocos de dados de um MIFARE Classic a partir do setor 1, na ordem de
+// gravação, sem os trailers (chaves e bits de acesso). O setor 0 fica de
+// fora: o bloco 0 é do fabricante e os blocos 1-2 costumam ter o MAD.
+export fn blocosClassic(kind) {
+    let sectors = 16
+    if kind == "mifare_classic_4k" { sectors = 40 }
+    if kind == "mifare_mini" { sectors = 5 }
+    const out = []
+    for s in 1..sectors {
+        let first = s * 4
+        let count = 4
+        if s >= 32 {
+            first = 128 + (s - 32) * 16
+            count = 16
+        }
+        for i in 0..(count - 1) { out.push(first + i) }
+    }
+    return out
+}
+
+// Quantas páginas de usuário (da 4 em diante) um Ultralight/NTAG tem. Lê o
+// capability container da página 3 (E1 10 xx 00 nas tags formatadas: xx*8
+// bytes). Sem CC assume o Ultralight original, 48 bytes (páginas 4..15):
+// é o seguro, nunca toca nas páginas de configuração/senha das NTAG.
+// `override` em bytes força o valor (ex. 144 para uma NTAG213 em branco).
+fn paginasUltralight(card, override) {
+    if override > 0 { return int(override / 4), nil }
+    const cc = (card.readPages(3, 1)?).toList()
+    if cc[0] == 0xE1 && cc[2] > 0 { return cc[2] * 2, nil }
+    return 12, nil
+}
+
+// A área do registro num cartão: a lista de slots (blocos ou páginas) e o
+// tamanho de cada um. Use abrir(card) para criar.
+export struct Armazenamento {
+    card = nil
+    slots = []
+    slotSize = 16
+    key = ""
+
+    new(card) {
+        this.card = card
+    }
+
+    // Bytes disponíveis para o registro (sem o cabeçalho).
+    capacidade() { return len(this.slots) * this.slotSize - HEADER }
+
+    // "blocos" ou "páginas", para mensagens.
+    unidade() {
+        if this.slotSize == 16 { return "blocos" }
+        return "páginas"
+    }
+
+    _lerSlot(slot) {
+        if this.slotSize == 16 { return this.card.readBlock(slot, this.key) }
+        return this.card.readPages(slot, 1)
+    }
+
+    _gravarSlot(slot, data) {
+        if this.slotSize == 16 { return this.card.writeBlock(slot, data, this.key) }
+        return this.card.writePages(slot, data)
+    }
+
+    // Os primeiros n bytes da área (arredondado para cima ao slot).
+    lerBytes(n) {
+        const data = []
+        let i = 0
+        while len(data) < n && i < len(this.slots) {
+            const chunk = this._lerSlot(this.slots[i])?
+            for b in chunk.toList() { data.push(b) }
+            i += 1
+        }
+        return bytes(data), nil
+    }
+
+    // Lê o registro; erro se não houver um.
+    ler() {
+        const head = this.lerBytes(HEADER)?
+        if !temRegistro(head) { return nil, error("o cartão não tem um registro (cabeçalho FP ausente)") }
+        const n = tamanho(head)
+        if n > this.capacidade() {
+            return nil, error(`cabeçalho anuncia ${n} bytes, mais do que a área do cartão (${this.capacidade()})`)
+        }
+        return decode(this.lerBytes(HEADER + n)?)
+    }
+
+    // Grava o registro a partir do primeiro slot. Devolve quantos slots usou.
+    gravar(registro) {
+        const data = (encode(registro)?).toList()
+        if len(data) - HEADER > this.capacidade() {
+            return nil, error(`registro de ${len(data) - HEADER} bytes não cabe: o cartão tem ${this.capacidade()} bytes livres`)
+        }
+        const usados = int((len(data) + this.slotSize - 1) / this.slotSize)
+        for i in 0..usados {
+            const chunk = []
+            for j in 0..this.slotSize {
+                const k = i * this.slotSize + j
+                if k < len(data) { chunk.push(data[k]) } else { chunk.push(0) }
+            }
+            this._gravarSlot(this.slots[i], bytes(chunk))?
+        }
+        return usados, nil
+    }
+
+    // Zera a área ocupada pelo registro (ou só o cabeçalho, se não há um).
+    // Devolve quantos slots zerou.
+    apagar() {
+        const head = this.lerBytes(HEADER)?
+        let total = HEADER
+        if temRegistro(head) { total = HEADER + tamanho(head) }
+        let usados = int((total + this.slotSize - 1) / this.slotSize)
+        if usados > len(this.slots) { usados = len(this.slots) }
+        const zeros = []
+        for j in 0..this.slotSize { zeros.push(0) }
+        for i in 0..usados { this._gravarSlot(this.slots[i], bytes(zeros))? }
+        return usados, nil
+    }
+}
+
+// Prepara a área do registro para o cartão conectado (um scard.Card, ou
+// qualquer objeto com family, kind e os métodos de leitura/gravação).
+// options: key (chave A do Classic, hex; "" = FFFFFFFFFFFF),
+//          bytes (área de usuário do Ultralight/NTAG quando a tag não tem CC).
+export fn abrir(card, options = {}) {
+    const a = new Armazenamento(card)
+    a.key = options.get("key", "")
+    if card.family == "mifare_classic" {
+        a.slots = blocosClassic(card.kind)
+        a.slotSize = 16
+    } else if card.family == "mifare_ultralight" {
+        const n = paginasUltralight(card, options.get("bytes", 0))?
+        const pages = []
+        for p in 4..(4 + n) { pages.push(p) }
+        a.slots = pages
+        a.slotSize = 4
+    } else {
+        return nil, error(`cartão ${card.kind} (${card.family}) não é de memória: os dados pessoais de um cartão com chip ficam na aplicação dele (use selectAid/readRecord/updateBinary conforme o cartão)`)
+    }
+    return a, nil
+}

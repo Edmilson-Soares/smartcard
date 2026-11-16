@@ -1,0 +1,123 @@
+// Exemplo — informação pessoal num cartão: grava, lê e apaga um registro
+// (nome, nascimento, documento, telefone, e-mail) em MIFARE Classic ou
+// Ultralight/NTAG, com qualquer leitor PC/SC. O formato está em registro.fg.
+//   fogu run examples/pessoa.fg ler
+//   fogu run examples/pessoa.fg gravar                 (pergunta os campos)
+//   fogu run examples/pessoa.fg gravar "Ana Silva" 1990-05-12 12345678 912345678 ana@exemplo.pt
+//   fogu run examples/pessoa.fg apagar
+//   fogu run examples/pessoa.fg gravar --help
+// Opções (depois do comando):
+//   --chave A0A1A2A3A4A5   chave A do MIFARE Classic (padrão FFFFFFFFFFFF)
+//   --bytes 144            área de usuário de um Ultralight/NTAG sem capability
+//                          container (NTAG213 144, NTAG215 504, NTAG216 888; padrão 48)
+//   --leitor "nome"        usar um leitor específico
+import scard from "../scard.fg"
+import registro from "./registro.fg"
+import cli from "fogu:cli"
+import system from "fogu:system"
+
+const OPCOES = [
+    { name: "chave", long: "chave", type: "str", default: "", help: "chave A do MIFARE Classic, em hex (padrão FFFFFFFFFFFF)" },
+    { name: "bytes", long: "bytes", type: "int", default: 0, help: "área de usuário do Ultralight/NTAG sem capability container (padrão 48)" },
+    { name: "leitor", long: "leitor", type: "str", default: "", help: "nome do leitor PC/SC (padrão: o primeiro com cartão)" },
+]
+
+const SPEC = {
+    name: "pessoa",
+    about: "Grava, lê e apaga um registro pessoal num cartão MIFARE Classic ou Ultralight/NTAG.",
+    commands: [
+        { name: "ler", about: "mostra o registro do cartão", args: OPCOES },
+        {
+            name: "gravar",
+            about: "grava um registro (sem campos, pergunta no terminal)",
+            // o posicional múltiplo vai antes das opções na lista
+            args: [{ name: "campos", positional: true, multiple: true, help: "nome nascimento documento telefone email" }].concat(OPCOES),
+        },
+        { name: "apagar", about: "zera a área do registro", args: OPCOES },
+    ],
+}
+
+fn mostrar(reg) {
+    const linhas = []
+    for c in registro.CAMPOS { linhas.push([registro.ROTULOS[c], reg.get(c, "")]) }
+    print(cli.table(linhas, { style: "rounded" }))
+}
+
+// Pergunta cada campo no terminal.
+fn perguntar() {
+    const reg = {}
+    for c in registro.CAMPOS {
+        reg[c] = (cli.input(registro.ROTULOS[c], { allowEmpty: true })?).trim()
+    }
+    return reg, nil
+}
+
+fn main() {
+    // --help / erro de uso: o parse imprime e sai sozinho (exit padrão).
+    const opts = cli.parse(SPEC, system.args)
+    let cmd = opts.command ?? "ler"
+    const args = opts.get("args", {})
+
+    const ctx = scard.open()?
+    if len(ctx.readers()?) == 0 {
+        return nil, error("nenhum leitor PC/SC encontrado; conecte um e rode de novo")
+    }
+    print("aproxime o cartão do leitor (30s)...")
+    const ev = ctx.waitForCard(args.get("leitor", ""), 30s)?
+    if ev == nil { return nil, error("nenhum cartão em 30s") }
+
+    const card = ctx.connect(ev.reader)?
+    const id = card.identify(false)?           // só pelo ATR: rápido e sem APDUs
+    print(`cartão: ${id.name} (${card.kind}), UID ${card.uid()?}`)
+
+    const area = registro.abrir(card, { key: args.get("chave", ""), bytes: args.get("bytes", 0) })?
+    print(`  área do registro: ${area.capacidade()} bytes em ${len(area.slots)} ${area.unidade()} (a partir de ${area.slots[0]})`)
+
+    if cmd == "ler" {
+        const [reg, lerr] = area.ler()
+        if lerr != nil && lerr.message.contains("não tem um registro") {
+            print("o cartão está vazio: ainda não tem um registro pessoal.")
+            print("grave um com:")
+            print("  fogu run examples/pessoa.fg gravar                 (pergunta os campos)")
+            print(`  fogu run examples/pessoa.fg gravar "Ana Silva" 1990-05-12 12345678 912345678 ana@exemplo.pt`)
+        } else if lerr != nil {
+            return nil, lerr
+        } else {
+            print("registro no cartão:")
+            mostrar(reg)
+        }
+    } else if cmd == "gravar" {
+        const campos = args.get("campos", [])
+        let reg = {}
+        if len(campos) > 0 {
+            for i, c in registro.CAMPOS {
+                if i < len(campos) { reg[c] = campos[i] } else { reg[c] = "" }
+            }
+        } else {
+            reg = perguntar()?
+        }
+        const usados = area.gravar(reg)?
+        print(`gravado em ${usados} ${area.unidade()}; lendo de volta para conferir...`)
+        const lido = area.ler()?
+        for c in registro.CAMPOS {
+            if lido[c] != reg[c].trim() {
+                return nil, error(`campo ${c} lido diferente do gravado: '${lido[c]}' != '${reg[c]}'`)
+            }
+        }
+        print("conferido:")
+        mostrar(lido)
+    } else {
+        const usados = area.apagar()?
+        print(`registro apagado (${usados} ${area.unidade()} zerados)`)
+    }
+
+    card.close()?
+    ctx.close()?
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil {
+    print(`erro: ${err.message}`)
+    system.exit(1)
+}
