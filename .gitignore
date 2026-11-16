@@ -13,7 +13,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# fogusmartcard (lib Rust), biblioteca gerada e base de ATRs baixada (atrlist)
+# fogusmartcard (lib Rust), base de ATRs baixada (atrlist)
 fogusmartcard/target/
-native/
 data/
